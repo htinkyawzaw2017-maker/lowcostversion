@@ -100,3 +100,18 @@ aws secretsmanager create-secret --name dub-studio/gemini \
 ```
 
 See `docs/OPERATIONS.md` for deployment and IAM details.
+
+## Hosting it on AWS
+
+One command from AWS CloudShell builds the whole stack (S3 + Secrets Manager +
+least-privilege IAM + EC2 with Docker, nginx and the built frontend):
+
+```bash
+git clone <this repo> dub && cd dub && bash deploy/aws-deploy.sh
+```
+
+- `AWS-HOST-GUIDE.txt` — full hosting guide: cost table, provider rollout order,
+  GPU box, hardening, troubleshooting, teardown.
+- `docs/AWS_DEPLOY_MY.md` — the same guide in Burmese (မြန်မာလမ်းညွှန်, ၁၃ ဆင့်).
+- `deploy/install-on-server.sh` — install/update directly on an existing Ubuntu box.
+- `HANDOFF.md` — project state, decisions, and known gaps.

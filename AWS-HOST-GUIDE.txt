@@ -1,0 +1,245 @@
+===============================================================================
+ DUBBING STUDIO - AWS HOSTING GUIDE (plain text, copy-paste friendly)
+===============================================================================
+
+ Read this top to bottom once, then just run the three commands in PART 2.
+ Burmese version: docs/AWS_DEPLOY_MY.md
+ Operations detail: docs/OPERATIONS.md
+
+-------------------------------------------------------------------------------
+ PART 0 - WHAT YOU ARE BUILDING
+-------------------------------------------------------------------------------
+
+   your browser
+        |  http, no API keys ever leave the server
+        v
+   [ EC2 t3.small, Ubuntu ]
+        nginx  :80   -> static React build  +  /api proxy
+        api    :8000 -> FastAPI (Docker)
+        worker       -> job runner (Docker), survives browser close
+        sqlite       -> /app/data in a docker volume
+        |
+        +--> S3 bucket            video / audio / exports (presigned PUT+GET)
+        +--> Secrets Manager      Gemini API key
+        +--> GPU box (optional)   lip-sync beta only, started on demand
+
+ Cost, Singapore region, rough:
+   t3.small  24/7 ............ US$15 / month   (stop it when idle -> ~US$3)
+   EBS 30 GB gp3 ............. US$2.4 / month
+   S3 50 GB .................. US$1.2 / month  (lifecycle deletes after 30d)
+   Secrets Manager ........... US$0.40 / month
+   Gemini .................... pay per use, only for text work
+   GPU (g4dn.xlarge spot) .... ~US$0.20 / hour, only while lip-syncing
+   ------------------------------------------------------------------
+   typical idle-aware total .. US$5-20 / month
+
+-------------------------------------------------------------------------------
+ PART 1 - BEFORE YOU START
+-------------------------------------------------------------------------------
+
+  [ ] AWS account with a payment method
+  [ ] This repo pushed to GitHub (public, or a token-in-URL for private)
+  [ ] A region picked. ap-southeast-1 (Singapore) is closest to Myanmar.
+  [ ] Optional: a Gemini API key from https://aistudio.google.com/apikey
+
+  You do NOT need: Terraform, CloudFormation, a domain name, Docker on your
+  laptop, or any local tooling. Everything runs in AWS CloudShell.
+
+-------------------------------------------------------------------------------
+ PART 2 - THE WHOLE DEPLOY, THREE COMMANDS
+-------------------------------------------------------------------------------
+
+  1. AWS Console -> pick your region -> click the ">_" CloudShell icon.
+  2. In the terminal that opens:
+
+       git clone https://github.com/<you>/<repo>.git dub
+       cd dub
+       bash deploy/aws-deploy.sh
+
+  3. Wait 5-10 minutes. At the end it prints:
+
+       Open            http://<public-ip>
+       Access token    <64 hex chars>
+
+  Open the URL, go to Settings, paste the token, done. The app is live in mock
+  mode: fully clickable, zero AI spend.
+
+  Tunables (export before running):
+
+       export REGION=ap-southeast-1
+       export INSTANCE_TYPE=t3.small      # t3.micro to test, t3.medium for films
+       export VOLUME_GB=30
+       export BUCKET=my-own-bucket-name
+       export GEMINI_API_KEY=...          # or add it later, see PART 5
+       export ACCESS_TOKEN=...            # or let it generate one
+
+  Re-running the script is safe. It updates what exists instead of duplicating.
+
+-------------------------------------------------------------------------------
+ PART 3 - WHAT THE SCRIPT ACTUALLY DID (13 steps)
+-------------------------------------------------------------------------------
+
+   1  S3 bucket, private, AES256 encrypted, public access blocked
+   2  Lifecycle rule: project media expires after 30 days
+   3  CORS so the browser can PUT straight to S3 (tighten AllowedOrigins later)
+   4  Secrets Manager entry dub-studio/gemini
+   5  IAM role: GetObject/PutObject/DeleteObject on that bucket, ListBucket,
+      GetSecretValue on that one secret. Nothing else. No admin, no wildcards.
+   6  Instance profile binding the role to EC2
+   7  SSH key pair, saved to ~/<stack>-key.pem inside CloudShell
+   8  Security group: 22 from your CloudShell IP only, 80 from anywhere
+   9  cloud-init boot script
+  10  Latest Ubuntu 24.04 AMI id from SSM
+  11  EC2 instance launch (IMDSv2 required, gp3 root volume)
+  12  Wait for boot + poll /api/health
+  13  Print the URL, token, and the follow-up commands
+
+  On the box itself the boot script installed Docker, Node 20, nginx, cloned
+  the repo to /opt/dub, wrote backend/.env, ran `docker compose up -d api
+  worker`, built the frontend into /var/www/dub, and configured nginx.
+
+-------------------------------------------------------------------------------
+ PART 4 - FIRST RUN CHECKLIST (mock mode, free)
+-------------------------------------------------------------------------------
+
+  [ ] New project
+  [ ] Upload a 30-second test clip (one front-facing speaker is ideal)
+  [ ] Run pipeline -> watch the Jobs tab
+  [ ] Close the browser tab, reopen it: the job kept running. That is the point.
+  [ ] Editor: change a line, change timing, Re-voice one segment
+  [ ] Export: MP4, WAV, MP3, SRT, VTT all download
+
+  If all six pass, the plumbing is correct and you can start spending money on
+  real providers.
+
+-------------------------------------------------------------------------------
+ PART 5 - TURNING ON REAL PROVIDERS, ONE AT A TIME
+-------------------------------------------------------------------------------
+
+  Store the Gemini key (from CloudShell, not from the box):
+
+      aws secretsmanager put-secret-value --region ap-southeast-1 \
+        --secret-id dub-studio/gemini \
+        --secret-string '{"GEMINI_API_KEY":"your-key"}'
+
+  SSH in:
+
+      ssh -i ~/dub-studio-key.pem ubuntu@<public-ip>
+      cd /opt/dub && sudo nano backend/.env
+
+  Flip ONE line, restart, test with a short clip, then flip the next:
+
+      DUB_PROVIDER_RENDER=ffmpeg             # 1. real media in/out
+      DUB_PROVIDER_TRANSCRIPTION=faster_whisper
+      DUB_PROVIDER_TRANSLATION=gemini
+      DUB_PROVIDER_TTS_MY=mms_tts
+      DUB_PROVIDER_TTS_EN=piper
+      DUB_PROVIDER_LIPSYNC=gpu_worker        # last, optional, beta
+
+      sudo docker compose up -d
+      sudo docker compose logs -f
+
+  The local models need extra Python packages: uncomment the optional block in
+  backend/requirements.txt, then `sudo docker compose up -d --build`. The first
+  run downloads model weights (slow); they are cached in the image afterwards.
+
+  Order matters. Render first means every later failure is clearly an AI
+  failure, not a media-plumbing failure.
+
+-------------------------------------------------------------------------------
+ PART 6 - THE OPTIONAL GPU BOX (lip-sync beta)
+-------------------------------------------------------------------------------
+
+  Do not keep a GPU running. Launch g4dn.xlarge as a spot instance only when
+  you want lip-sync, in the same VPC/security group, then:
+
+      cd /opt/dub
+      export LIPSYNC_ENGINE_CMD='python inference.py --face {video} --audio {audio} --outfile {out}'
+      docker compose --profile gpu up -d lipsync
+
+  On the CPU box set:
+
+      DUB_PROVIDER_LIPSYNC=gpu_worker
+      DUB_LIPSYNC_WORKER_URL=http://<gpu-private-ip>:9100
+
+  Constraints enforced server-side: clips longer than 20s are rejected, one
+  front-facing speaker assumed. If lip-sync fails the project is NOT failed -
+  you keep the audio-only dub. Terminate the GPU box when you are done.
+
+-------------------------------------------------------------------------------
+ PART 7 - DAY TO DAY
+-------------------------------------------------------------------------------
+
+  Logs           cd /opt/dub && sudo docker compose logs -f
+  Boot log       sudo tail -f /var/log/dub-bootstrap.log
+  Restart        cd /opt/dub && sudo docker compose restart
+  Update code    cd /opt/dub && sudo git pull && sudo bash deploy/install-on-server.sh
+  Disk check     df -h  (renders eat space; exports live in S3, temp files don't)
+  Stop the box   aws ec2 stop-instances  --instance-ids i-xxxx
+  Start again    aws ec2 start-instances --instance-ids i-xxxx   (public IP changes)
+  Backup         the SQLite job store lives in the `dubdata` docker volume:
+                 sudo docker run --rm -v dub_dubdata:/d -v /tmp:/b alpine \
+                   tar czf /b/dub-backup.tgz -C /d .
+                 aws s3 cp /tmp/dub-backup.tgz s3://<bucket>/backups/
+
+-------------------------------------------------------------------------------
+ PART 8 - HARDENING (do this before putting anything real on it)
+-------------------------------------------------------------------------------
+
+  [ ] DUB_REQUIRE_AUTH=true with a long random DUB_ACCESS_TOKEN (default on)
+  [ ] Restrict port 80 to your own IP, or put Cloudflare Access / a VPN in front
+  [ ] Replace S3 CORS "*" with your actual origin
+  [ ] Add a domain + HTTPS:  sudo apt install certbot python3-certbot-nginx
+                             sudo certbot --nginx -d dub.example.com
+  [ ] Set an AWS Budget alert (Billing -> Budgets -> US$20)
+  [ ] Never put the Gemini key in backend/.env on a shared box - use the secret
+
+-------------------------------------------------------------------------------
+ PART 9 - TROUBLESHOOTING
+-------------------------------------------------------------------------------
+
+  Browser shows nothing / connection refused
+      Bootstrap is still running. sudo tail -f /var/log/dub-bootstrap.log
+      Takes 5-10 min on t3.small (npm build is the slow part).
+
+  502 Bad Gateway
+      API container down. sudo docker compose ps ; sudo docker compose logs api
+
+  Upload fails with 403
+      Presigned URL expired (DUB_S3_PRESIGN_TTL, default 3600) or bucket CORS
+      does not include your origin.
+
+  Everything is labelled mock-*
+      A provider module failed to import and the registry fell back to mock.
+      Check the Settings page and the API log for the import error.
+
+  "artifact not ready"
+      The render job has not finished. Jobs tab shows progress.
+
+  Segments flagged "long"
+      The dubbed line does not fit the original gap. Shorten the text or lower
+      the speed and Re-voice; the mixer applies only a capped atempo nudge.
+
+  Out of memory during transcription
+      t3.small has 2 GB. Use a smaller whisper model, add 2 GB of swap, or move
+      to t3.medium.
+
+  Cannot SSH
+      Your IP changed. Re-add it:
+      aws ec2 authorize-security-group-ingress --group-id sg-xxx --protocol tcp \
+        --port 22 --cidr $(curl -s https://checkip.amazonaws.com)/32
+
+-------------------------------------------------------------------------------
+ PART 10 - TEARDOWN
+-------------------------------------------------------------------------------
+
+      cd dub && bash deploy/aws-deploy.sh destroy
+
+  Removes the instance, IAM role/profile, and security group. Keeps the S3
+  bucket and the secret on purpose. To remove those too:
+
+      aws s3 rb s3://<bucket> --force
+      aws secretsmanager delete-secret --secret-id dub-studio/gemini \
+        --force-delete-without-recovery
+
+===============================================================================
