@@ -1,0 +1,30 @@
+# Low-cost layout: one small CPU box runs the API + worker.
+# The GPU lip-sync worker is a separate, optional service you start only when needed.
+services:
+  api:
+    build: ./backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    environment:
+      DUB_WORKER_INLINE: "0"        # dedicated worker container below
+      DUB_PROVIDER_STORAGE: s3
+    env_file: [backend/.env]
+    ports: ["8000:8000"]
+    volumes: ["dubdata:/app/data"]
+
+  worker:
+    build: ./backend
+    command: python -m app.workers.runner   # survives browser closing, API restarts
+    env_file: [backend/.env]
+    volumes: ["dubdata:/app/data"]
+    depends_on: [api]
+
+  # Start on a GPU host / spot instance only for the lip-sync beta.
+  lipsync:
+    build: ./backend
+    command: uvicorn app.workers.gpu_lipsync_worker:app --host 0.0.0.0 --port 9100
+    profiles: ["gpu"]
+    ports: ["9100:9100"]
+    volumes: ["dubdata:/app/data"]
+
+volumes:
+  dubdata:
